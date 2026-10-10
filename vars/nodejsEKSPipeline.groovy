@@ -14,7 +14,7 @@ def call(Map configMap = [:]) {
 
         options {
             disableConcurrentBuilds()
-            timeout(time: 15, unit: 'MINUTES')
+            timeout(time: 30, unit: 'MINUTES')
         }
 
         stages {
@@ -23,6 +23,11 @@ def call(Map configMap = [:]) {
                     script {
                         def packageJson = readJSON file: 'package.json'
                         appVersion = packageJson.version
+
+                        if (!appVersion) {
+                            error 'Version is missing from package.json'
+                        }
+
                         echo "Application version: ${appVersion}"
                     }
                 }
@@ -39,13 +44,21 @@ def call(Map configMap = [:]) {
                     script {
                         try {
                             sh 'npm test'
+
                             utils.updateCommitStatus(
                                 'success',
                                 'Unit tests passed',
                                 'unit-tests'
                             )
                         } catch (Exception e) {
-                            echo "Unit tests or status reporting failed: ${e.message}"
+                            echo "Unit tests failed: ${e.message}"
+
+                            utils.updateCommitStatus(
+                                'failure',
+                                'Unit tests failed',
+                                'unit-tests'
+                            )
+
                             throw e
                         }
                     }
@@ -57,8 +70,10 @@ def call(Map configMap = [:]) {
                 steps {
                     script {
                         def scannerHome = tool 'sonar-scanner'
+
                         withSonarQubeEnv('sonar-server') {
                             sh """
+                                set -eu
                                 "${scannerHome}/bin/sonar-scanner" \
                                   -Dsonar.projectKey=Roboshop-catalogue \
                                   -Dsonar.projectName=Roboshop-catalogue \
@@ -75,6 +90,7 @@ def call(Map configMap = [:]) {
                     timeout(time: 10, unit: 'MINUTES') {
                         script {
                             def qg = waitForQualityGate()
+
                             if (qg.status != 'OK') {
                                 error "SonarQube Quality Gate failed: ${qg.status}"
                             }
@@ -95,18 +111,18 @@ def call(Map configMap = [:]) {
                                 )
                             ]) {
                                 withEnv([
-                                    "SCAN_REPO=sivajanardhan9989/Cataloguee"
+                                    'SCAN_REPO=sivajanardhan9989/Cataloguee'
                                 ]) {
                                     sh '''
                                         set -eu
 
-                                        HTTP_STATUS=$(curl -sS -L \
-                                            -o alerts.json \
-                                            -w "%{http_code}" \
-                                            -H "Accept: application/vnd.github+json" \
-                                            -H "Authorization: Bearer $GH_TOKEN" \
-                                            -H "X-GitHub-Api-Version: 2022-11-28" \
-                                            "https://api.github.com/repos/$SCAN_REPO/dependabot/alerts?state=open&per_page=100")
+                                        HTTP_STATUS=$(curl -sS \
+                                          -o alerts.json \
+                                          -w "%{http_code}" \
+                                          -H "Accept: application/vnd.github+json" \
+                                          -H "Authorization: Bearer $GH_TOKEN" \
+                                          -H "X-GitHub-Api-Version: 2022-11-28" \
+                                          "https://api.github.com/repos/$SCAN_REPO/dependabot/alerts?state=open&per_page=100")
 
                                         if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
                                             echo "Dependabot API failed: HTTP $HTTP_STATUS"
@@ -124,20 +140,19 @@ def call(Map configMap = [:]) {
 
                                         echo "---- Open Dependabot Alerts ----"
 
-                                        jq -r '.[] |
-                                            [
-                                                (.number | tostring),
-                                                .security_vulnerability.severity,
-                                                .dependency.package.name,
-                                                .security_advisory.ghsa_id
-                                            ] | @tsv' alerts.json
+                                        jq -r '.[] | [
+                                          (.number | tostring),
+                                          (.security_vulnerability.severity // "unknown"),
+                                          (.dependency.package.name // "unknown"),
+                                          (.security_advisory.ghsa_id // "unknown")
+                                        ] | @tsv' alerts.json
 
                                         HIGH_CRITICAL_COUNT=$(jq '[
-                                            .[] |
-                                            select(
-                                                .security_vulnerability.severity == "high" or
-                                                .security_vulnerability.severity == "critical"
-                                            )
+                                          .[] |
+                                          select(
+                                            .security_vulnerability.severity == "high" or
+                                            .security_vulnerability.severity == "critical"
+                                          )
                                         ] | length' alerts.json)
 
                                         echo "High/Critical alert count: $HIGH_CRITICAL_COUNT"
@@ -159,6 +174,12 @@ def call(Map configMap = [:]) {
                                 'library-scan'
                             )
                         } catch (Exception e) {
+                            utils.updateCommitStatus(
+                                'failure',
+                                'Dependabot scan failed',
+                                'library-scan'
+                            )
+
                             echo "Dependency scan failed: ${e.message}"
                             throw e
                         }
@@ -177,10 +198,10 @@ def call(Map configMap = [:]) {
                                 set -eu
 
                                 aws ecr get-login-password --region us-east-1 |
-                                    docker login --username AWS --password-stdin ${acc_id}.dkr.ecr.us-east-1.amazonaws.com
+                                  docker login --username AWS --password-stdin ${acc_id}.dkr.ecr.us-east-1.amazonaws.com
 
                                 docker build \
-                                    -t ${acc_id}.dkr.ecr.us-east-1.amazonaws.com/${project}/${component}:${appVersion} .
+                                  -t ${acc_id}.dkr.ecr.us-east-1.amazonaws.com/${project}/${component}:${appVersion} .
                             """
                         }
 
@@ -196,43 +217,7 @@ def call(Map configMap = [:]) {
             /*
             stage('trivy-scan') {
                 steps {
-                    script {
-                        def image = "${acc_id}.dkr.ecr.us-east-1.amazonaws.com/${project}/${component}:${appVersion}"
-
-                        def osScan = sh(
-                            script: """
-                                trivy image --scanners vuln --pkg-types os \
-                                  --severity HIGH,CRITICAL --exit-code 1 \
-                                  --format table --output trivy-os-report.txt \
-                                  ${image}
-                            """,
-                            returnStatus: true
-                        )
-
-                        def dockerfileScan = sh(
-                            script: '''
-                                trivy config --severity HIGH,CRITICAL \
-                                  --exit-code 1 --format table \
-                                  --output trivy-dockerfile-report.txt Dockerfile
-                            ''',
-                            returnStatus: true
-                        )
-
-                        archiveArtifacts(
-                            artifacts: 'trivy-*.txt',
-                            allowEmptyArchive: true
-                        )
-
-                        if (osScan != 0 || dockerfileScan != 0) {
-                            error "Trivy scan failed: OS=${osScan}, Dockerfile=${dockerfileScan}"
-                        }
-
-                        utils.updateCommitStatus(
-                            'success',
-                            'Trivy scan passed',
-                            'trivy-scan'
-                        )
-                    }
+                    echo 'Trivy scan is disabled.'
                 }
             }
             */
@@ -245,6 +230,7 @@ def call(Map configMap = [:]) {
                             region: 'us-east-1'
                         ) {
                             sh """
+                                set -eu
                                 docker push ${acc_id}.dkr.ecr.us-east-1.amazonaws.com/${project}/${component}:${appVersion}
                             """
                         }
@@ -268,17 +254,20 @@ def call(Map configMap = [:]) {
                             ) {
                                 sh """
                                     set -eu
-                                    aws eks update-kubeconfig --name roboshop --region us-east-1
+
+                                    aws eks update-kubeconfig \
+                                      --name roboshop \
+                                      --region us-east-1
 
                                     helm upgrade --install ${component} ./helm \
-                                        -f ./helm/values-dev.yaml \
-                                        --namespace roboshop-dev \
-                                        --create-namespace \
-                                        --set deployment.imageVersion=${appVersion} \
-                                        --wait --timeout 5m
+                                      -f ./helm/values-dev.yaml \
+                                      --namespace roboshop-dev \
+                                      --create-namespace \
+                                      --set deployment.imageVersion=${appVersion} \
+                                      --wait --timeout 5m
 
                                     kubectl rollout status deployment/${component} \
-                                        -n roboshop-dev --timeout=120s
+                                      -n roboshop-dev --timeout=120s
                                 """
                             }
 
@@ -288,6 +277,12 @@ def call(Map configMap = [:]) {
                                 'dev-deploy'
                             )
                         } catch (Exception e) {
+                            utils.updateCommitStatus(
+                                'failure',
+                                'Dev deployment failed',
+                                'dev-deploy'
+                            )
+
                             echo "Dev deployment failed: ${e.message}"
                             throw e
                         }
@@ -297,37 +292,49 @@ def call(Map configMap = [:]) {
 
             stage('api-tests') {
                 options {
-                    timeout(time: 2, unit: 'MINUTES')
+                    timeout(time: 5, unit: 'MINUTES')
                 }
                 steps {
                     script {
-                        build job: 'ROBOSHOP/catalogue-api-tests',
-                            parameters: [
-                                string(
-                                    name: 'NAMESPACE',
-                                    value: 'roboshop-dev'
-                                ),
-                                string(
-                                    name: 'COMMIT_ID',
-                                    value: env.GIT_COMMIT
-                                )
-                            ],
-                            wait: true,
-                            propagate: true
+                        try {
+                            build job: 'ROBOSHOP/catalogue-api-tests',
+                                parameters: [
+                                    string(
+                                        name: 'NAMESPACE',
+                                        value: 'roboshop-dev'
+                                    ),
+                                    string(
+                                        name: 'COMMIT_ID',
+                                        value: env.GIT_COMMIT ?: ''
+                                    )
+                                ],
+                                wait: true,
+                                propagate: true
 
-                        utils.updateCommitStatus(
-                            'success',
-                            'Catalogue API tests passed',
-                            'api-tests'
-                        )
+                            utils.updateCommitStatus(
+                                'success',
+                                'Catalogue API tests passed',
+                                'api-tests'
+                            )
+                        } catch (Exception e) {
+                            utils.updateCommitStatus(
+                                'failure',
+                                'Catalogue API tests failed',
+                                'api-tests'
+                            )
+
+                            echo "API tests failed: ${e.message}"
+                            throw e
+                        }
                     }
                 }
             }
 
             stage('raise-pr') {
                 when {
-                    not {
-                        branch 'main'
+                    expression {
+                        env.BRANCH_NAME &&
+                        env.BRANCH_NAME != 'main'
                     }
                 }
                 steps {
@@ -340,25 +347,74 @@ def call(Map configMap = [:]) {
                         ]) {
                             withEnv([
                                 "PR_HEAD=${env.BRANCH_NAME}",
-                                "PR_REPO=sivajanardhan9989/Cataloguee",
+                                'PR_REPO=sivajanardhan9989/Cataloguee',
+                                'PR_REPO_OWNER=sivajanardhan9989',
                                 "PR_TITLE=${component}: ${env.BRANCH_NAME} -> main",
                                 "PR_BODY=Automated PR after successful dev deployment and API tests. Build: ${env.BUILD_URL}console"
                             ]) {
                                 sh '''
                                     set -eu
 
-                                    # Reuse an existing open PR for this branch if present.
-                                    curl -fsSL \
-                                        -H "Authorization: Bearer $GH_TOKEN" \
-                                        -H "Accept: application/vnd.github+json" \
-                                        -H "X-GitHub-Api-Version: 2022-11-28" \
-                                        "https://api.github.com/repos/$PR_REPO/pulls?state=open&base=main&head=$PR_REPO_OWNER:$PR_HEAD" \
-                                        -o prs.json
+                                    # Look for an existing open PR from this branch.
+                                    curl -fsSL --get \
+                                      -H "Authorization: Bearer $GH_TOKEN" \
+                                      -H "Accept: application/vnd.github+json" \
+                                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                                      --data-urlencode "state=open" \
+                                      --data-urlencode "base=main" \
+                                      --data-urlencode "head=$PR_REPO_OWNER:$PR_HEAD" \
+                                      "https://api.github.com/repos/$PR_REPO/pulls" \
+                                      -o prs.json
+
+                                    if ! jq -e 'type == "array"' prs.json >/dev/null; then
+                                        echo "Unexpected response while checking pull requests:"
+                                        jq '.' prs.json
+                                        rm -f prs.json
+                                        exit 1
+                                    fi
+
+                                    PR_NUMBER=$(jq -r '.[0].number // empty' prs.json)
+                                    rm -f prs.json
+
+                                    if [ -n "$PR_NUMBER" ]; then
+                                        echo "Open pull request already exists: #$PR_NUMBER"
+                                        exit 0
+                                    fi
+
+                                    # Create a PR if none exists.
+                                    jq -n \
+                                      --arg title "$PR_TITLE" \
+                                      --arg head "$PR_HEAD" \
+                                      --arg base "main" \
+                                      --arg body "$PR_BODY" \
+                                      '{title:$title, head:$head, base:$base, body:$body}' \
+                                      > pr-payload.json
+
+                                    HTTP_STATUS=$(curl -sS \
+                                      -o pr-response.json \
+                                      -w "%{http_code}" \
+                                      -X POST \
+                                      -H "Authorization: Bearer $GH_TOKEN" \
+                                      -H "Accept: application/vnd.github+json" \
+                                      -H "X-GitHub-Api-Version: 2022-11-28" \
+                                      -H "Content-Type: application/json" \
+                                      --data @pr-payload.json \
+                                      "https://api.github.com/repos/$PR_REPO/pulls")
+
+                                    if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+                                        echo "Failed to create pull request: HTTP $HTTP_STATUS"
+                                        jq -r '.message // .' pr-response.json
+                                        rm -f pr-payload.json pr-response.json
+                                        exit 1
+                                    fi
+
+                                    echo "Pull request created:"
+                                    jq -r '"PR #\(.number): \(.html_url)"' pr-response.json
+
+                                    rm -f pr-payload.json pr-response.json
                                 '''
                             }
                         }
-
-                        echo 'Check GitHub pull request permissions and repository owner configuration before enabling automated PR creation.'
                     }
                 }
             }
