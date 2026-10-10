@@ -8,7 +8,7 @@ def call(Map configMap) {
     def env_PROJECT = ''
     def env_VERSION = ''
     def env_CR_NUMBER = ''
-    def acc_id = '160885265516'
+    def acc_id = '209115427888'
     def project = configMap.get('project') ?: 'roboshop'
     def component = configMap.get('component') ?: 'catalogue'
 
